@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import json
 import os
 
-TOKEN = "YOUR_BOT_TOKEN"
+TOKEN = "TOKEN"
 
 TARGET_THREADS = [
     1473961871806824562,
@@ -167,3 +167,4 @@ async def on_ready():
     auto_update.start()
 
 bot.run(TOKEN)
+
