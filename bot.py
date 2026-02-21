@@ -4,7 +4,12 @@ from datetime import datetime, timedelta
 import json
 import os
 
-TOKEN = "TOKEN"
+# 🔥 Railway用（環境変数から取得）
+TOKEN = os.getenv("TOKEN")
+
+if TOKEN is None:
+    print("TOKENが設定されていません。RailwayのVariablesを確認してください。")
+    exit()
 
 TARGET_THREADS = [
     1473961871806824562,
@@ -36,6 +41,7 @@ DATA_FILE = "data.json"
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# データ読み込み
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
@@ -145,7 +151,10 @@ async def on_ready():
     print("Bot起動完了")
 
     for thread_id in TARGET_THREADS:
-        thread = await bot.fetch_channel(thread_id)
+        try:
+            thread = await bot.fetch_channel(thread_id)
+        except:
+            continue
 
         recover(thread_id)
         save_data()
@@ -167,4 +176,3 @@ async def on_ready():
     auto_update.start()
 
 bot.run(TOKEN)
-
