@@ -130,20 +130,25 @@ class StaminaPanel(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="1消費", style=discord.ButtonStyle.primary, custom_id="stamina:use")
-    async def use(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = str(interaction.user.id)
-        charges, last_tick, _ = await self._load_and_recover(user_id)
+    @discord.ui.button(label="使用する（0にリセット）", style=discord.ButtonStyle.primary, custom_id="stamina:use")
+async def use(self, interaction: discord.Interaction, button: discord.ui.Button):
+    user_id = str(interaction.user.id)
 
-        if charges <= 0:
-            return await interaction.response.send_message("❌ 回復回数がありません（0/5）", ephemeral=True)
+    # 最新の回復を反映してから判定
+    charges, last_tick, _ = await self._load_and_recover(user_id)
 
-        charges -= 1
-        await storage.set_state(user_id, charges, last_tick)
-        await interaction.response.send_message(
-            "✅ 1消費しました。\n" + render_status(interaction.user, charges, last_tick, utcnow()),
-            ephemeral=True
-        )
+    if charges <= 0:
+        return await interaction.response.send_message("❌ 回復回数がありません（0/5）", ephemeral=True)
+
+    # 押したら必ず0にする＆タイマーも今から再スタート
+    now = utcnow()
+    await storage.set_state(user_id, 0, now)
+
+    await interaction.response.send_message(
+        f"✅ 使用しました。**{charges} 回分**を消費して **0/5** にリセットしました。\n"
+        f"⏱ 次の+1は **3時間後** から始まります。",
+        ephemeral=True
+    )
 
     @discord.ui.button(label="0にリセット", style=discord.ButtonStyle.danger, custom_id="stamina:reset")
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
