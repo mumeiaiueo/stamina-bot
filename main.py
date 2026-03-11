@@ -1,11 +1,12 @@
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.errors import HTTPException, LoginFailure
 from supabase import create_client, Client
 
 UTC = timezone.utc
@@ -15,6 +16,9 @@ MAX_STOCK_DEFAULT = 5
 RECOVER_MINUTES_DEFAULT = 180  # 3時間
 
 
+# =========================================================
+# ENV
+# =========================================================
 def get_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -22,14 +26,24 @@ def get_env(name: str) -> str:
     return value
 
 
+def get_env_int(name: str) -> int:
+    value = get_env(name)
+    try:
+        return int(value)
+    except ValueError:
+        raise RuntimeError(f"{name} が数値ではありません: {value}")
+
+
 TOKEN = get_env("BOT_TOKEN")
 SUPABASE_URL = get_env("SUPABASE_URL").rstrip("/")
 SUPABASE_KEY = get_env("SUPABASE_KEY")
+LOG_CHANNEL_ID = get_env_int("LOG_CHANNEL_ID")
 
 print("===== STARTUP CHECK =====")
 print("BOT_TOKEN set:", bool(TOKEN))
 print("SUPABASE_URL:", SUPABASE_URL)
 print("SUPABASE_KEY prefix:", SUPABASE_KEY[:10] if SUPABASE_KEY else "None")
+print("LOG_CHANNEL_ID:", LOG_CHANNEL_ID)
 
 try:
     sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -39,6 +53,9 @@ except Exception as e:
     raise
 
 
+# =========================================================
+# TIME / STOCK
+# =========================================================
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -85,10 +102,30 @@ def full_recovery_at(last_used_at: Optional[datetime], max_stock: int, recover_m
     return utc_now() + timedelta(minutes=remain * recover_minutes)
 
 
+# =========================================================
+# DISCORD
+# =========================================================
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# =========================================================
+# HELPERS
+# =========================================================
+def is_supported_channel(
+    channel: Optional[discord.abc.GuildChannel | discord.Thread]
+) -> bool:
+    return isinstance(channel, (discord.TextChannel, discord.Thread))
+
+
+def get_place_name(channel: Union[discord.TextChannel, discord.Thread]) -> str:
+    return getattr(channel, "name", "不明")
+
+
+# =========================================================
+# DB
+# channel_id に thread.id も text_channel.id もそのまま入れる
+# =========================================================
 class StaminaRepo:
     def __init__(self):
         self._locks: dict[int, asyncio.Lock] = {}
@@ -119,12 +156,11 @@ class StaminaRepo:
         rows = res.data or []
         return rows[0] if rows else None
 
-    async def upsert_panel(self, guild_id: int, channel_id: int, panel_message_id=None, log_channel_id=None):
+    async def upsert_panel(self, guild_id: int, channel_id: int, panel_message_id=None):
         payload = {
             "guild_id": guild_id,
             "channel_id": channel_id,
             "panel_message_id": panel_message_id,
-            "log_channel_id": log_channel_id,
             "max_stock": MAX_STOCK_DEFAULT,
             "recover_minutes": RECOVER_MINUTES_DEFAULT,
             "updated_at": utc_now().isoformat(),
@@ -141,19 +177,6 @@ class StaminaRepo:
                 sb.table("stamina_panels")
                 .update({
                     "panel_message_id": panel_message_id,
-                    "updated_at": utc_now().isoformat()
-                })
-                .eq("channel_id", channel_id)
-                .execute()
-            )
-        return await self._db(work)
-
-    async def set_log_channel(self, channel_id: int, log_channel_id: Optional[int]):
-        def work():
-            return (
-                sb.table("stamina_panels")
-                .update({
-                    "log_channel_id": log_channel_id,
                     "updated_at": utc_now().isoformat()
                 })
                 .eq("channel_id", channel_id)
@@ -193,7 +216,10 @@ class StaminaRepo:
 repo = StaminaRepo()
 
 
-def build_embed(row: dict) -> discord.Embed:
+# =========================================================
+# UI
+# =========================================================
+def build_embed(row: dict, place_name: str) -> discord.Embed:
     max_stock = int(row.get("max_stock") or MAX_STOCK_DEFAULT)
     recover_minutes = int(row.get("recover_minutes") or RECOVER_MINUTES_DEFAULT)
     last_used_at = parse_iso_to_utc(row.get("last_used_at"))
@@ -205,6 +231,7 @@ def build_embed(row: dict) -> discord.Embed:
     bars = "🟩" * stock + "⬜" * (max_stock - stock)
 
     lines = [
+        f"**対象**: {place_name}",
         f"**現在残数**: {stock}/{max_stock}",
         f"**表示**: {bars}",
         f"**回復**: 3時間ごとに1回復",
@@ -222,37 +249,23 @@ def build_embed(row: dict) -> discord.Embed:
 
 
 async def send_log(
-    guild: discord.Guild,
-    row: dict,
     user: discord.Member | discord.User,
-    used_channel,
-    before_stock: int,
+    used_channel: Union[discord.TextChannel, discord.Thread],
 ):
-    log_channel_id = row.get("log_channel_id")
-    if not log_channel_id:
-        return
+    place_name = get_place_name(used_channel)
 
-    log_channel = guild.get_channel(int(log_channel_id))
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel is None:
         try:
-            log_channel = await guild.fetch_channel(int(log_channel_id))
+            log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
         except Exception as e:
             print("⚠️ log channel fetch error:", repr(e))
             return
 
-    embed = discord.Embed(
-        title="回復使用ログ",
-        description=(
-            f"**ユーザー**: {user.mention} (`{user.id}`)\n"
-            f"**チャンネル**: {getattr(used_channel, 'mention', '不明')}\n"
-            f"**使用前残数**: {before_stock}\n"
-            f"**使用後残数**: 0\n"
-            f"**時刻**: {to_jst_text(utc_now())}"
-        )
-    )
+    message = f"{user.mention} が **{place_name}** を使用しました"
 
     try:
-        await log_channel.send(embed=embed)
+        await log_channel.send(message)
     except Exception as e:
         print("⚠️ send_log error:", repr(e))
 
@@ -263,11 +276,12 @@ class RecoveryView(discord.ui.View):
 
     @discord.ui.button(label="使用する", style=discord.ButtonStyle.danger, custom_id="recovery_use_zero")
     async def use_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild is None or interaction.channel is None:
-            await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
+        if interaction.guild is None or interaction.channel is None or not is_supported_channel(interaction.channel):
+            await interaction.response.send_message("サーバー内のテキストチャンネル/スレッドで使ってください。", ephemeral=True)
             return
 
-        channel_id = interaction.channel.id
+        channel = interaction.channel
+        channel_id = channel.id
         lock = repo.get_lock(channel_id)
 
         async with lock:
@@ -279,7 +293,7 @@ class RecoveryView(discord.ui.View):
                 return
 
             if not row:
-                await interaction.response.send_message("このチャンネルは未設定です。", ephemeral=True)
+                await interaction.response.send_message("この場所は未設定です。", ephemeral=True)
                 return
 
             max_stock = int(row.get("max_stock") or MAX_STOCK_DEFAULT)
@@ -303,11 +317,12 @@ class RecoveryView(discord.ui.View):
                 await interaction.response.send_message("使用処理でエラーが出ました。", ephemeral=True)
                 return
 
-            await interaction.response.edit_message(embed=build_embed(row), view=RecoveryView())
-            await send_log(interaction.guild, row, interaction.user, interaction.channel, before_stock)
+            place_name = get_place_name(channel)
+            await interaction.response.edit_message(embed=build_embed(row, place_name), view=RecoveryView())
+            await send_log(interaction.user, channel)
 
 
-async def refresh_panel(channel: discord.TextChannel):
+async def refresh_panel(channel: Union[discord.TextChannel, discord.Thread]):
     row = await repo.get_panel(channel.id)
     if not row:
         return False
@@ -322,10 +337,14 @@ async def refresh_panel(channel: discord.TextChannel):
         print("⚠️ fetch_message error:", repr(e))
         return False
 
-    await msg.edit(embed=build_embed(row), view=RecoveryView())
+    place_name = get_place_name(channel)
+    await msg.edit(embed=build_embed(row, place_name), view=RecoveryView())
     return True
 
 
+# =========================================================
+# EVENTS
+# =========================================================
 @bot.event
 async def setup_hook():
     print("===== SETUP HOOK =====")
@@ -351,16 +370,17 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
 
-@bot.tree.command(name="stamina_setup", description="このチャンネルに回復パネルを設置")
-@app_commands.describe(log_channel="管理者ログ送信先")
-async def stamina_setup(interaction: discord.Interaction, log_channel: Optional[discord.TextChannel] = None):
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
+# =========================================================
+# COMMANDS
+# スレッド内でも使える
+# =========================================================
+@bot.tree.command(name="stamina_setup", description="この場所に回復パネルを設置")
+async def stamina_setup(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.channel is None or not is_supported_channel(interaction.channel):
+        await interaction.response.send_message("サーバー内のテキストチャンネル/スレッドで使ってください。", ephemeral=True)
         return
 
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("テキストチャンネルで使ってください。", ephemeral=True)
-        return
+    channel = interaction.channel
 
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
@@ -370,15 +390,16 @@ async def stamina_setup(interaction: discord.Interaction, log_channel: Optional[
     try:
         await repo.upsert_panel(
             guild_id=interaction.guild.id,
-            channel_id=interaction.channel.id,
+            channel_id=channel.id,
             panel_message_id=None,
-            log_channel_id=log_channel.id if log_channel else None
         )
 
-        row = await repo.get_panel(interaction.channel.id)
+        row = await repo.get_panel(channel.id)
+        place_name = get_place_name(channel)
+
         await interaction.response.send_message("回復パネルを作成しました。", ephemeral=True)
-        msg = await interaction.channel.send(embed=build_embed(row), view=RecoveryView())
-        await repo.set_panel_message_id(interaction.channel.id, msg.id)
+        msg = await channel.send(embed=build_embed(row, place_name), view=RecoveryView())
+        await repo.set_panel_message_id(channel.id, msg.id)
 
     except Exception as e:
         print("❌ stamina_setup error:", repr(e))
@@ -388,33 +409,34 @@ async def stamina_setup(interaction: discord.Interaction, log_channel: Optional[
 
 @bot.tree.command(name="stamina_status", description="現在の状態を確認")
 async def stamina_status(interaction: discord.Interaction):
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
+    if interaction.guild is None or interaction.channel is None or not is_supported_channel(interaction.channel):
+        await interaction.response.send_message("サーバー内のテキストチャンネル/スレッドで使ってください。", ephemeral=True)
         return
 
+    channel = interaction.channel
+
     try:
-        row = await repo.get_panel(interaction.channel.id)
+        row = await repo.get_panel(channel.id)
     except Exception as e:
         print("❌ stamina_status error:", repr(e))
         await interaction.response.send_message("状態取得でエラーが出ました。", ephemeral=True)
         return
 
     if not row:
-        await interaction.response.send_message("このチャンネルは未設定です。", ephemeral=True)
+        await interaction.response.send_message("この場所は未設定です。", ephemeral=True)
         return
 
-    await interaction.response.send_message(embed=build_embed(row), ephemeral=True)
+    place_name = get_place_name(channel)
+    await interaction.response.send_message(embed=build_embed(row, place_name), ephemeral=True)
 
 
 @bot.tree.command(name="stamina_refresh", description="パネルを手動更新")
 async def stamina_refresh(interaction: discord.Interaction):
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
+    if interaction.guild is None or interaction.channel is None or not is_supported_channel(interaction.channel):
+        await interaction.response.send_message("サーバー内のテキストチャンネル/スレッドで使ってください。", ephemeral=True)
         return
 
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("テキストチャンネルで使ってください。", ephemeral=True)
-        return
+    channel = interaction.channel
 
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
@@ -422,7 +444,7 @@ async def stamina_refresh(interaction: discord.Interaction):
         return
 
     try:
-        ok = await refresh_panel(interaction.channel)
+        ok = await refresh_panel(channel)
     except Exception as e:
         print("❌ stamina_refresh error:", repr(e))
         await interaction.response.send_message("更新中にエラーが出ました。", ephemeral=True)
@@ -431,37 +453,13 @@ async def stamina_refresh(interaction: discord.Interaction):
     await interaction.response.send_message("更新しました。" if ok else "更新失敗です。", ephemeral=True)
 
 
-@bot.tree.command(name="stamina_logset", description="ログ送信先を設定")
-@app_commands.describe(log_channel="ログ送信先")
-async def stamina_logset(interaction: discord.Interaction, log_channel: discord.TextChannel):
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
-        return
-
-    perms = interaction.user.guild_permissions
-    if not (perms.administrator or perms.manage_guild):
-        await interaction.response.send_message("管理者のみ使えます。", ephemeral=True)
-        return
-
-    try:
-        row = await repo.get_panel(interaction.channel.id)
-        if not row:
-            await interaction.response.send_message("先に /stamina_setup をしてください。", ephemeral=True)
-            return
-
-        await repo.set_log_channel(interaction.channel.id, log_channel.id)
-        await interaction.response.send_message(f"ログ送信先を {log_channel.mention} に設定しました。", ephemeral=True)
-
-    except Exception as e:
-        print("❌ stamina_logset error:", repr(e))
-        await interaction.response.send_message("ログ設定中にエラーが出ました。", ephemeral=True)
-
-
 @bot.tree.command(name="stamina_full", description="全回復にする")
 async def stamina_full(interaction: discord.Interaction):
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
+    if interaction.guild is None or interaction.channel is None or not is_supported_channel(interaction.channel):
+        await interaction.response.send_message("サーバー内のテキストチャンネル/スレッドで使ってください。", ephemeral=True)
         return
+
+    channel = interaction.channel
 
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
@@ -469,15 +467,13 @@ async def stamina_full(interaction: discord.Interaction):
         return
 
     try:
-        row = await repo.get_panel(interaction.channel.id)
+        row = await repo.get_panel(channel.id)
         if not row:
-            await interaction.response.send_message("このチャンネルは未設定です。", ephemeral=True)
+            await interaction.response.send_message("この場所は未設定です。", ephemeral=True)
             return
 
-        await repo.set_full(interaction.channel.id)
-
-        if isinstance(interaction.channel, discord.TextChannel):
-            await refresh_panel(interaction.channel)
+        await repo.set_full(channel.id)
+        await refresh_panel(channel)
 
         await interaction.response.send_message("全回復にしました。", ephemeral=True)
 
@@ -486,4 +482,46 @@ async def stamina_full(interaction: discord.Interaction):
         await interaction.response.send_message("全回復処理でエラーが出ました。", ephemeral=True)
 
 
-bot.run(TOKEN)
+# =========================================================
+# RUN
+# 429で即死ループしにくくする
+# =========================================================
+async def run_bot_forever():
+    while True:
+        try:
+            print("🚀 bot.start() 開始")
+            await bot.start(TOKEN)
+
+        except LoginFailure as e:
+            print("❌ BOT_TOKEN が無効です:", repr(e))
+            raise
+
+        except HTTPException as e:
+            status = getattr(e, "status", None)
+            code = getattr(e, "code", None)
+            text = getattr(e, "text", "")
+            print(f"❌ Discord HTTPException: status={status}, code={code}")
+            if text:
+                print("HTTP text:", str(text)[:500])
+
+            if status == 429:
+                wait_sec = 900  # 15分
+                print(f"⏳ 429です。{wait_sec // 60}分待って再試行します。")
+                await asyncio.sleep(wait_sec)
+                continue
+
+            raise
+
+        except Exception as e:
+            print("❌ bot起動エラー:", repr(e))
+            print("⏳ 60秒後に再試行します。")
+            await asyncio.sleep(60)
+            continue
+
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_bot_forever())
