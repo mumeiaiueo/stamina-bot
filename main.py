@@ -13,6 +13,7 @@ JST = timezone(timedelta(hours=9))
 
 MAX_STOCK_DEFAULT = 5
 RECOVER_MINUTES_DEFAULT = 180  # 3時間
+AUTO_REFRESH_SECONDS = 1800    # 30分ごとに見た目更新
 
 
 # =========================================================
@@ -121,6 +122,21 @@ def get_place_name(channel: Union[discord.TextChannel, discord.Thread]) -> str:
     return getattr(channel, "name", "不明")
 
 
+async def get_channel_any(channel_id: int):
+    channel = bot.get_channel(channel_id)
+    if channel is not None and is_supported_channel(channel):
+        return channel
+
+    try:
+        channel = await bot.fetch_channel(channel_id)
+        if is_supported_channel(channel):
+            return channel
+    except Exception as e:
+        print("⚠️ get_channel_any error:", repr(e))
+
+    return None
+
+
 # =========================================================
 # DB
 # =========================================================
@@ -140,6 +156,13 @@ class StaminaRepo:
         def work():
             return sb.table("stamina_panels").select("channel_id").limit(1).execute()
         return await self._db(work)
+
+    async def list_panels(self):
+        def work():
+            return sb.table("stamina_panels").select("*").execute()
+
+        res = await self._db(work)
+        return res.data or []
 
     async def get_panel(self, channel_id: int):
         def work():
@@ -340,6 +363,38 @@ async def refresh_panel(channel: Union[discord.TextChannel, discord.Thread]):
     return True
 
 
+async def auto_refresh_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            rows = await repo.list_panels()
+
+            for row in rows:
+                try:
+                    channel_id = int(row["channel_id"])
+                except Exception:
+                    continue
+
+                channel = await get_channel_any(channel_id)
+                if channel is None:
+                    continue
+
+                try:
+                    await refresh_panel(channel)
+                except Exception as e:
+                    print(f"⚠️ auto refresh failed: channel_id={channel_id}", repr(e))
+
+                # 連続編集しすぎ防止
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            print("❌ auto_refresh_loop error:", repr(e))
+
+        # 30分ごとに見た目更新
+        await asyncio.sleep(AUTO_REFRESH_SECONDS)
+
+
 # =========================================================
 # EVENTS
 # =========================================================
@@ -354,6 +409,7 @@ async def setup_hook():
         raise
 
     bot.add_view(RecoveryView())
+    asyncio.create_task(auto_refresh_loop())
 
 
 @bot.event
