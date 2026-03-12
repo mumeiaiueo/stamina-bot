@@ -6,7 +6,6 @@ from typing import Optional, Union
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.errors import HTTPException, LoginFailure
 from supabase import create_client, Client
 
 UTC = timezone.utc
@@ -124,7 +123,6 @@ def get_place_name(channel: Union[discord.TextChannel, discord.Thread]) -> str:
 
 # =========================================================
 # DB
-# channel_id に thread.id も text_channel.id もそのまま入れる
 # =========================================================
 class StaminaRepo:
     def __init__(self):
@@ -372,7 +370,6 @@ async def on_ready():
 
 # =========================================================
 # COMMANDS
-# スレッド内でも使える
 # =========================================================
 @bot.tree.command(name="stamina_setup", description="この場所に回復パネルを設置")
 async def stamina_setup(interaction: discord.Interaction):
@@ -381,7 +378,6 @@ async def stamina_setup(interaction: discord.Interaction):
         return
 
     channel = interaction.channel
-
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
         await interaction.response.send_message("管理者のみ使えます。", ephemeral=True)
@@ -437,7 +433,6 @@ async def stamina_refresh(interaction: discord.Interaction):
         return
 
     channel = interaction.channel
-
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
         await interaction.response.send_message("管理者のみ使えます。", ephemeral=True)
@@ -460,7 +455,6 @@ async def stamina_full(interaction: discord.Interaction):
         return
 
     channel = interaction.channel
-
     perms = interaction.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
         await interaction.response.send_message("管理者のみ使えます。", ephemeral=True)
@@ -474,7 +468,6 @@ async def stamina_full(interaction: discord.Interaction):
 
         await repo.set_full(channel.id)
         await refresh_panel(channel)
-
         await interaction.response.send_message("全回復にしました。", ephemeral=True)
 
     except Exception as e:
@@ -484,44 +477,6 @@ async def stamina_full(interaction: discord.Interaction):
 
 # =========================================================
 # RUN
-# 429で即死ループしにくくする
 # =========================================================
-async def run_bot_forever():
-    while True:
-        try:
-            print("🚀 bot.start() 開始")
-            await bot.start(TOKEN)
-
-        except LoginFailure as e:
-            print("❌ BOT_TOKEN が無効です:", repr(e))
-            raise
-
-        except HTTPException as e:
-            status = getattr(e, "status", None)
-            code = getattr(e, "code", None)
-            text = getattr(e, "text", "")
-            print(f"❌ Discord HTTPException: status={status}, code={code}")
-            if text:
-                print("HTTP text:", str(text)[:500])
-
-            if status == 429:
-                wait_sec = 900  # 15分
-                print(f"⏳ 429です。{wait_sec // 60}分待って再試行します。")
-                await asyncio.sleep(wait_sec)
-                continue
-
-            raise
-
-        except Exception as e:
-            print("❌ bot起動エラー:", repr(e))
-            print("⏳ 60秒後に再試行します。")
-            await asyncio.sleep(60)
-            continue
-
-        finally:
-            if not bot.is_closed():
-                await bot.close()
-
-
 if __name__ == "__main__":
-    asyncio.run(run_bot_forever())
+    bot.run(TOKEN)
