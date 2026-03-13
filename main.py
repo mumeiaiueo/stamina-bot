@@ -13,7 +13,6 @@ JST = timezone(timedelta(hours=9))
 
 MAX_STOCK_DEFAULT = 5
 RECOVER_MINUTES_DEFAULT = 180  # 3時間
-AUTO_REFRESH_SECONDS = 1800    # 30分ごとに見た目更新
 
 
 # =========================================================
@@ -60,6 +59,10 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def jst_now() -> datetime:
+    return datetime.now(JST)
+
+
 def parse_iso_to_utc(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -100,6 +103,19 @@ def full_recovery_at(last_used_at: Optional[datetime], max_stock: int, recover_m
         return None
     remain = max_stock - stock
     return utc_now() + timedelta(minutes=remain * recover_minutes)
+
+
+def seconds_until_next_half_hour() -> int:
+    now = jst_now()
+    next_run = now.replace(second=0, microsecond=0)
+
+    if now.minute < 30:
+        next_run = next_run.replace(minute=30)
+    else:
+        next_run = (next_run + timedelta(hours=1)).replace(minute=0)
+
+    wait_seconds = int((next_run - now).total_seconds())
+    return max(1, wait_seconds)
 
 
 # =========================================================
@@ -160,7 +176,6 @@ class StaminaRepo:
     async def list_panels(self):
         def work():
             return sb.table("stamina_panels").select("*").execute()
-
         res = await self._db(work)
         return res.data or []
 
@@ -367,6 +382,10 @@ async def auto_refresh_loop():
     await bot.wait_until_ready()
 
     while not bot.is_closed():
+        wait_seconds = seconds_until_next_half_hour()
+        print(f"⏳ 次の自動更新まで {wait_seconds} 秒")
+        await asyncio.sleep(wait_seconds)
+
         try:
             rows = await repo.list_panels()
 
@@ -385,14 +404,14 @@ async def auto_refresh_loop():
                 except Exception as e:
                     print(f"⚠️ auto refresh failed: channel_id={channel_id}", repr(e))
 
-                # 連続編集しすぎ防止
+                # Discordへの連続編集を少し抑える
                 await asyncio.sleep(1)
+
+            print("✅ 自動更新完了")
 
         except Exception as e:
             print("❌ auto_refresh_loop error:", repr(e))
-
-        # 30分ごとに見た目更新
-        await asyncio.sleep(AUTO_REFRESH_SECONDS)
+            await asyncio.sleep(10)
 
 
 # =========================================================
